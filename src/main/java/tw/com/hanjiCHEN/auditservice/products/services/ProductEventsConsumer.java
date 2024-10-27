@@ -10,13 +10,16 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import software.amazon.awssdk.services.sqs.SqsAsyncClient;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageResponse;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 import tw.com.hanjiCHEN.auditservice.events.dto.ProductEventDto;
 import tw.com.hanjiCHEN.auditservice.events.dto.ProductEventType;
 import tw.com.hanjiCHEN.auditservice.events.dto.SnsMessageDto;
+import tw.com.hanjiCHEN.auditservice.products.repositories.ProductEventsRepository;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 @Service
 public class ProductEventsConsumer {
@@ -25,11 +28,13 @@ public class ProductEventsConsumer {
     private final SqsAsyncClient sqsAsyncClient;
     private final String productEventsQueueUrl;
     private final ReceiveMessageRequest receiveMessageRequest;
+    private final ProductEventsRepository productEventsRepository;
 
     @Autowired
     public ProductEventsConsumer(ObjectMapper objectMapper,
                                  SqsAsyncClient sqsAsyncClient,
-                                 @Value("${aws.sqs.queue.product.event.url}") String productEventsQueueUrl) {
+                                 @Value("${aws.sqs.queue.product.event.url}") String productEventsQueueUrl,
+                                 ProductEventsRepository productEventsRepository) {
 
         this.objectMapper = objectMapper;
         this.sqsAsyncClient = sqsAsyncClient;
@@ -39,6 +44,7 @@ public class ProductEventsConsumer {
                 .maxNumberOfMessages(5) //每次從queue中最多取出多少訊息處理
                 .queueUrl(productEventsQueueUrl)
                 .build();
+        this.productEventsRepository = productEventsRepository;
     }
 
     @Scheduled(fixedDelay = 1000)//每秒執行一次
@@ -49,15 +55,24 @@ public class ProductEventsConsumer {
             messages.parallelStream().forEach(message -> {
                 try {
                     SnsMessageDto snsMessageDto = objectMapper.readValue(message.body(), SnsMessageDto.class);
-                    ThreadContext.put("messageId", snsMessageDto.messageId());
-                    ThreadContext.put("requestId", snsMessageDto.messageAttributes().requestId().value());
+                    String requestId = snsMessageDto.messageAttributes().requestId().value();
+                    String messageId = snsMessageDto.messageId();
+                    String traceId = snsMessageDto.messageAttributes().traceId().value();
+
+                    ThreadContext.put("messageId", messageId);
+                    ThreadContext.put("requestId", requestId);
                     ProductEventType eventType = ProductEventType
                             .valueOf(snsMessageDto.messageAttributes().eventType().value());
 
+                    CompletableFuture<Void> productEventFuture;
                     switch (eventType) {
                         case PRODUCT_CREATED, PRODUCT_UPDATED, PRODUCT_DELETED -> {
                             ProductEventDto productEventDto =
                                     objectMapper.readValue(snsMessageDto.message(), ProductEventDto.class);
+
+                            productEventFuture = productEventsRepository.create(productEventDto, eventType,
+                                    messageId, requestId, traceId);
+
                             LOG.info("Product event: {} - Id: {}", eventType, productEventDto.id());
                         }
                         default -> {
@@ -66,12 +81,15 @@ public class ProductEventsConsumer {
                         }
                     }
 
-                    sqsAsyncClient.deleteMessage(DeleteMessageRequest.builder()
-                            .queueUrl(productEventsQueueUrl)
-                            .receiptHandle(message.receiptHandle())
-                            .build()).join();
-                    LOG.info("Message deleted...");
+                    CompletableFuture<DeleteMessageResponse> deleteMessageResponseCompletableFuture =
+                            sqsAsyncClient.deleteMessage(DeleteMessageRequest.builder()
+                                    .queueUrl(productEventsQueueUrl)
+                                    .receiptHandle(message.receiptHandle())
+                                    .build());
 
+                    CompletableFuture.allOf(productEventFuture,deleteMessageResponseCompletableFuture).join();
+
+                    LOG.info("Message deleted...");
                 } catch (Exception e) {
                     LOG.error("Failed to parse product event message");
                     throw new RuntimeException(e);

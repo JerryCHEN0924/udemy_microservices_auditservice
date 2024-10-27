@@ -10,13 +10,16 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import software.amazon.awssdk.services.sqs.SqsAsyncClient;
 import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageResponse;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 import tw.com.hanjiCHEN.auditservice.events.dto.ProductEventType;
 import tw.com.hanjiCHEN.auditservice.events.dto.ProductFailureEventDto;
 import tw.com.hanjiCHEN.auditservice.events.dto.SnsMessageDto;
+import tw.com.hanjiCHEN.auditservice.products.repositories.ProductFailureEventsRepository;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 @Service
 public class ProductFailureEventsConsumer {
@@ -25,12 +28,14 @@ public class ProductFailureEventsConsumer {
     private final SqsAsyncClient sqsAsyncClient;
     private final String productFailureEventsQueueUrl;
     private final ReceiveMessageRequest receiveMessageRequest;
+    private final ProductFailureEventsRepository productFailureEventsRepository;
 
     @Autowired
     public ProductFailureEventsConsumer(ObjectMapper objectMapper,
                                         SqsAsyncClient sqsAsyncClient,
                                         @Value("${aws.sqs.queue.product.failure.events.url}")
-                                        String productFailureEventsQueueUrl) {
+                                        String productFailureEventsQueueUrl,
+                                        ProductFailureEventsRepository productFailureEventsRepository) {
 
         this.objectMapper = objectMapper;
         this.sqsAsyncClient = sqsAsyncClient;
@@ -40,6 +45,7 @@ public class ProductFailureEventsConsumer {
                 .maxNumberOfMessages(10) //每次從queue中最多取出多少訊息處理
                 .queueUrl(productFailureEventsQueueUrl)
                 .build();
+        this.productFailureEventsRepository = productFailureEventsRepository;
     }
 
     @Scheduled(fixedDelay = 5000)//每5秒執行一次
@@ -50,26 +56,38 @@ public class ProductFailureEventsConsumer {
             messages.parallelStream().forEach(message -> {
                 try {
                     SnsMessageDto snsMessageDto = objectMapper.readValue(message.body(), SnsMessageDto.class);
-                    ThreadContext.put("messageId", snsMessageDto.messageId());
-                    ThreadContext.put("requestId", snsMessageDto.messageAttributes().requestId().value());
+                    String requestId = snsMessageDto.messageAttributes().requestId().value();
+                    String messageId = snsMessageDto.messageId();
+                    String traceId = snsMessageDto.messageAttributes().traceId().value();
+
+                    ThreadContext.put("messageId", messageId);
+                    ThreadContext.put("requestId", requestId);
                     ProductEventType eventType = ProductEventType
                             .valueOf(snsMessageDto.messageAttributes().eventType().value());
 
+                    CompletableFuture<Void> productFailureEventFuture;
                     if (ProductEventType.PRODUCT_FAILURE == eventType) {
-                        ProductFailureEventDto productEventDto =
+                        ProductFailureEventDto productFailureEventDto =
                                 objectMapper.readValue(snsMessageDto.message(), ProductFailureEventDto.class);
-                        LOG.info("Product failure event: {} - Id: {}", eventType, productEventDto.id());
+
+                        productFailureEventFuture = productFailureEventsRepository.create(productFailureEventDto, eventType,
+                                messageId, requestId, traceId);
+
+                        LOG.info("Product failure event: {} - Id: {}", eventType, productFailureEventDto.id());
                     } else {
                         LOG.error("Invalid product failure event:{}", eventType);
                         throw new Exception("Invalid product failure event");
                     }
 
-                    sqsAsyncClient.deleteMessage(DeleteMessageRequest.builder()
-                            .queueUrl(productFailureEventsQueueUrl)
-                            .receiptHandle(message.receiptHandle())
-                            .build()).join();
-                    LOG.info("Message deleted...");
+                    CompletableFuture<DeleteMessageResponse> deleteMessageResponseCompletableFuture =
+                            sqsAsyncClient.deleteMessage(DeleteMessageRequest.builder()
+                                    .queueUrl(productFailureEventsQueueUrl)
+                                    .receiptHandle(message.receiptHandle())
+                                    .build());
 
+                    CompletableFuture.allOf(productFailureEventFuture, deleteMessageResponseCompletableFuture).join();
+
+                    LOG.info("Message deleted...");
                 } catch (Exception e) {
                     LOG.error("Failed to parse product failure event message");
                     throw new RuntimeException(e);
